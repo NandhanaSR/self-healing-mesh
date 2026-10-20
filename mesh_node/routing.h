@@ -13,7 +13,7 @@
 //  * Route-switch hysteresis (TinyHeal eq. 15): we only leave the current next hop if the new
 //    path is cheaper by MORE than ROUTE_HYST_MARGIN - unless the current one is dead/unreachable,
 //    in which case we switch immediately. Stops routes flapping on small fluctuations.
-//  * The penalty for a Degrading link comes from predicted quality q_pred (link_penalty()).
+//  * The penalty for a Degrading link comes from predicted quality q_pred (link_penalty()), refreshed on every rx/tx while the link stays Degrading.
 #pragma once
 #include <stdint.h>
 #include "config.h"

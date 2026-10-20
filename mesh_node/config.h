@@ -45,6 +45,9 @@
 #endif
 #define ROUTE_HYST_MARGIN 0.10f // switch next hop only if new path is cheaper by MORE than this
 
+#define COST_ADV_DELTA 0.10f   // trigger an advert only if a DEGRADING link's cost moved by >= this
+#define ADV_MIN_GAP_MS 250     // minimum gap between triggered (non-periodic) adverts
+
 // ---- Sensors / anomaly detection ----
 #define SENSOR1_PIN 34 // ADC1 pins only (ADC2 breaks when WiFi is on)
 #define SENSOR2_PIN 35
