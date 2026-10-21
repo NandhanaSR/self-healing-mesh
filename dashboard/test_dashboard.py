@@ -59,6 +59,29 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(self.mesh.route_changes, 2)  # N1->N3 priority next, N3->N1 next
 
 
+class DemoLabelTests(unittest.TestCase):
+    def test_anomaly_panel_is_labelled_demo(self):
+        from demo_anomaly import DemoAnomalies
+        m = replay(SAMPLES)
+        a = DemoAnomalies(seed=1)
+        for _ in range(10):
+            a.step(m.by_id())
+        text = draw(m, replay_now(m), mode="REPLAY", anomalies=a)
+        self.assertIn("ANOMALY  DEMO", text)
+        self.assertIn("generated · no sensors", text)
+        self.assertIn("N3 s1", text)
+
+    def test_demo_label_even_live(self):
+        self.assertIn("DEMO", draw(LiveMesh(["COM3"]), 0.0))
+
+    def test_sim_banner(self):
+        from mesh_dashboard import SIM_MODE
+        _, mesh, _ = __import__("test_demo").run_sim(5)
+        text = draw(mesh, max(b.table_time for b in mesh.boards.values()), mode=SIM_MODE)
+        self.assertIn("SIM (simulated boards, not real)", text)
+        self.assertNotIn("● LIVE", text)
+
+
 class EmptyStateTests(unittest.TestCase):
     def test_nothing_connected(self):
         m = LiveMesh(["COM3", "COM4"])

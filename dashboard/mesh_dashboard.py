@@ -4,22 +4,21 @@
 Reads each board's serial output (one COM port per board) and shows what the boards
 report: link state, ewma, slope, PRR/dPRR, q and q_pred per link, and each board's
 next hop / priority next hop per destination. Nothing is recomputed in Python.
+The anomaly panel is the exception: no sensors are connected, so it shows generated
+data and is labelled DEMO.
 
 Run:   pip install rich pyserial
        python dashboard/mesh_dashboard.py --ports COM3 COM4 COM5 COM6
-       python dashboard/mesh_dashboard.py --replay dashboard/samples/mesh4/node*.txt   (one frame, no boards)
+       python dashboard/mesh_dashboard.py --demo                  (simulated boards, SIM on screen)
+       python dashboard/mesh_dashboard.py --replay FILE [FILE...] (one frame from captures)
 Keys:  Ctrl+C quit
 Best viewed in Windows Terminal of at least 140x42.
 """
 from __future__ import annotations
 
 import argparse
-import heapq
-import math
-import random
 import sys
 import time
-from collections import deque
 
 try:
     from rich import box
@@ -33,60 +32,15 @@ except ImportError:
     print("Missing dependency: pip install rich", file=sys.stderr)
     raise SystemExit(2)
 
+from demo_anomaly import HIST_LEN, DemoAnomalies, flag_names
+from demo_sim import SimMesh
 from live_model import MAX_NODES, LiveMesh, replay, replay_now
 
 # --------------------------------------------------------------------------- config
-TICK = 0.25                 # seconds per update
-EWMA_ALPHA = 0.20           # RSSI smoothing:  ewma = a*rssi + (1-a)*ewma
-LOSS_ALPHA = 0.08           # beacon-loss smoothing
-CONFIRM_TICKS = 3           # ticks a new link state must persist before it is announced
-SWITCH_CRIT_TICKS = 4       # critical ticks on the active radio before switching
-FAILBACK_TICKS = 40         # healthy ticks on the preferred radio before failing back (10 s)
-DOWN_MISS_TICKS = 12        # ticks without any received beacon -> link DOWN
-CYCLE = 80.0                # seconds in the interference pattern
-
-PROTO = {
-    "ESP-NOW": dict(floor=-90, good=-65, sens=-88, k=2.5, lat=(3, 9), color="green", tag="W"),
-    "LoRa":    dict(floor=-118, good=-95, sens=-112, k=3.0, lat=(85, 140), color="magenta", tag="L"),
-}
-
-NODES = {
-    1: dict(role="GATEWAY", radios="ESP-NOW + LoRa"),
-    2: dict(role="RELAY",   radios="ESP-NOW + LoRa"),
-    3: dict(role="RELAY",   radios="ESP-NOW"),
-    4: dict(role="LEAF",    radios="ESP-NOW"),
-}
-
-# (a, b, radio, nominal RSSI dBm)
-LINK_DEFS = [
-    (1, 2, "ESP-NOW", -58),
-    (1, 2, "LoRa",    -92),
-    (2, 3, "ESP-NOW", -62),
-    (3, 4, "ESP-NOW", -64),
-    (1, 3, "ESP-NOW", -76),
-    (2, 4, "ESP-NOW", -75),
-]
-
-STATE_RANK = {"GOOD": 0, "DEGRADED": 1, "CRITICAL": 2, "DOWN": 3}
-STATE_STYLE = {"GOOD": "green", "DEGRADED": "yellow", "CRITICAL": "bold red", "DOWN": "bold white on red"}
-LEVEL_STYLE = {"INFO": "cyan", "OK": "green", "WARN": "yellow", "CRIT": "bold red",
-               "SWITCH": "bold magenta", "ROUTE": "bright_blue"}
+TICK = 0.25                 # seconds per screen update
+SIM_MODE = "SIM (simulated boards, not real)"
+REPLAY_MODE = "REPLAY (recorded lines, not live)"
 BLOCKS = "▁▂▃▄▅▆▇█"
-
-
-def trap(x, a, b, c, d, depth):
-    """Trapezoid pulse: ramps 0->depth over [a,b], holds to c, ramps back by d."""
-    if x <= a or x >= d:
-        return 0.0
-    if x < b:
-        return depth * (x - a) / (b - a)
-    if x <= c:
-        return depth
-    return depth * (d - x) / (d - c)
-
-
-def fmt_path(path):
-    return "→".join(f"N{x}" for x in path)
 
 
 def spark(vals, lo, hi, width=14):
@@ -95,304 +49,6 @@ def spark(vals, lo, hi, width=14):
         frac = max(0.0, min(1.0, (v - lo) / (hi - lo)))
         out += BLOCKS[int(frac * 7)]
     return out
-
-
-# --------------------------------------------------------------------------- model
-class RadioLink:
-    def __init__(self, a, b, proto, base):
-        self.a, self.b, self.proto, self.base = a, b, proto, base
-        self.raw = base
-        self.ewma = float(base)
-        self.loss = 0.0
-        self.pdr = 1.0
-        self.pending = None
-        self.pn = 0
-        self.miss = 0
-        self.phase = random.uniform(0, 6.28)
-        self.hist = deque([float(base)] * 14, maxlen=14)
-        p = PROTO[proto]
-        comp = max(0.0, min(1.0, (base - p["floor"]) / (p["good"] - p["floor"])))
-        self.health = 100.0 * comp
-        self.state = "GOOD" if self.health >= 70 else "DEGRADED" if self.health >= 40 else "CRITICAL"
-
-    @property
-    def name(self):
-        return f"N{self.a}↔N{self.b}"
-
-
-class NodeStat:
-    def __init__(self):
-        self.tx = self.rx = self.fwd = self.drop = self.delivered = 0
-
-
-class Mesh:
-    def __init__(self):
-        self.t = 6.0
-        self.t0 = self.t
-        self.links = [RadioLink(*d) for d in LINK_DEFS]
-        self.by_key = {(l.a, l.b, l.proto): l for l in self.links}
-        self.adj = {n: set() for n in NODES}
-        for l in self.links:
-            self.adj[l.a].add(l.b)
-            self.adj[l.b].add(l.a)
-        self.active = {(1, 2): "ESP-NOW"}          # dual-radio pairs -> radio in use
-        self.crit_n = {(1, 2): 0}
-        self.good_n = {(1, 2): 0}
-        self.nodes = {n: NodeStat() for n in NODES}
-        self.proto = {p: dict(tx=0, rx=0, drop=0, lat=None) for p in PROTO}
-        self.routes = {}
-        self.events = deque(maxlen=200)
-        self.fault = {"ESP-NOW": False, "LoRa": False}
-        self.handovers = 0
-        self.route_changes = 0
-        self.sent = 0
-        self.delivered = 0
-        self.e2e_lat = None
-        self.window = deque(maxlen=16)
-        # neighbor table (as seen by N1): learned only from hello beacons of direct radio neighbors
-        self.neigh = {n: dict(seen=None, proto=None, rssi=None, ewma=None) for n in self.adj[1]}
-        self.paused = False
-
-        self.log("INFO", "Mesh online · 4 nodes · gateway N1")
-        self.log("INFO", "N1↔N2 dual-radio hop: ESP-NOW primary, LoRa standby")
-        self.compute_routes(initial=True)
-
-    # ---- helpers
-    def log(self, level, msg):
-        self.events.append((time.strftime("%H:%M:%S"), level, msg))
-
-    def get(self, a, b, proto):
-        return self.by_key.get((min(a, b), max(a, b), proto))
-
-    def edge(self, a, b):
-        k = (min(a, b), max(a, b))
-        proto = self.active.get(k, "ESP-NOW")
-        l = self.by_key.get((k[0], k[1], proto))
-        return l if l and l.state != "DOWN" else None
-
-    @staticmethod
-    def cost(l):
-        return 1.0 + (100.0 - l.health) / 25.0 + (0.6 if l.proto == "LoRa" else 0.0)
-
-    # ---- RF model
-    def offset(self, l, tc):
-        """Scripted interference (dB) on a link as a function of the cycle time."""
-        key = (l.a, l.b, l.proto)
-        off = 0.0
-        if key == (1, 2, "ESP-NOW"):
-            off += trap(tc, 10, 24, 44, 56, -34)
-        elif key == (3, 4, "ESP-NOW"):
-            off += trap(tc, 60, 64, 68, 72, -18)
-        elif key == (1, 2, "LoRa"):
-            off += trap(tc, 70, 72, 75, 77, -8)
-        if key == (1, 2, "ESP-NOW") and self.fault["ESP-NOW"]:
-            off -= 40
-        if key == (1, 2, "LoRa") and self.fault["LoRa"]:
-            off -= 40
-        return off
-
-    def sample_link(self, l):
-        p = PROTO[l.proto]
-        tc = self.t % CYCLE
-        fade = 2.2 * math.sin(2 * math.pi * self.t / 19.0 + l.phase)
-        true_rssi = l.base + self.offset(l, tc) + fade + random.gauss(0, 1.3)
-        l.pdr = 1.0 / (1.0 + math.exp(-(true_rssi - p["sens"]) / p["k"]))
-        ok = random.random() < l.pdr
-        if ok:                                   # RSSI is only measurable on a received frame
-            l.raw = int(round(true_rssi))
-            l.ewma = EWMA_ALPHA * l.raw + (1 - EWMA_ALPHA) * l.ewma
-            l.miss = 0
-        else:
-            l.miss += 1
-        l.loss = LOSS_ALPHA * (0.0 if ok else 1.0) + (1 - LOSS_ALPHA) * l.loss
-        l.hist.append(l.ewma)
-
-        # health 0..100 from RSSI EWMA position between floor and good, scaled by loss
-        if l.miss >= DOWN_MISS_TICKS:
-            l.health, raw_state = 0.0, "DOWN"
-        else:
-            comp = max(0.0, min(1.0, (l.ewma - p["floor"]) / (p["good"] - p["floor"])))
-            l.health = 100.0 * comp * (1.0 - min(1.0, l.loss)) ** 1.5
-            raw_state = "GOOD" if l.health >= 70 else "DEGRADED" if l.health >= 40 else "CRITICAL"
-
-        if raw_state == l.state:
-            l.pending, l.pn = None, 0
-            return
-        l.pn = l.pn + 1 if raw_state == l.pending else 1
-        l.pending = raw_state
-        if l.pn >= CONFIRM_TICKS:
-            old, l.state, l.pending, l.pn = l.state, raw_state, None, 0
-            self.on_state(l, old, raw_state)
-
-    def on_state(self, l, old, new):
-        if old in ("CRITICAL", "DOWN") and new in ("CRITICAL", "DOWN"):
-            return
-        detail = f"EWMA {l.ewma:.0f} dBm · loss {l.loss*100:.0f}% · health {l.health:.0f}"
-        msg = f"{l.proto} {l.name} {old} → {new}  ({detail})"
-        if STATE_RANK[new] > STATE_RANK[old]:
-            self.log("WARN" if new == "DEGRADED" else "CRIT", msg)
-        elif new == "GOOD":
-            self.log("OK", msg)
-        else:
-            self.log("INFO", msg)
-
-    # ---- protocol switching
-    def evaluate_pairs(self):
-        for k, act in list(self.active.items()):
-            pref, alt = self.get(*k, "ESP-NOW"), self.get(*k, "LoRa")
-            cur, other = (pref, alt) if act == "ESP-NOW" else (alt, pref)
-            bad = cur.state in ("CRITICAL", "DOWN")
-            self.crit_n[k] = self.crit_n[k] + 1 if bad else 0
-            other_ok = other.state not in ("CRITICAL", "DOWN")
-            if self.crit_n[k] >= SWITCH_CRIT_TICKS and other_ok:
-                self.active[k] = other.proto
-                self.handovers += 1
-                self.crit_n[k] = self.good_n[k] = 0
-                self.log("SWITCH",
-                         f"N{k[0]}↔N{k[1]} handover {cur.proto} → {other.proto}  "
-                         f"({cur.proto} {cur.ewma:.0f} dBm critical, {other.proto} {other.ewma:.0f} dBm)")
-                continue
-            if self.crit_n[k] == SWITCH_CRIT_TICKS and not other_ok:
-                self.log("CRIT", f"N{k[0]}↔N{k[1]}: both radios unhealthy, no clean alternate")
-            if act == "LoRa":
-                self.good_n[k] = self.good_n[k] + 1 if pref.state == "GOOD" else 0
-                if self.good_n[k] >= FAILBACK_TICKS:
-                    self.active[k] = "ESP-NOW"
-                    self.handovers += 1
-                    self.good_n[k] = 0
-                    self.log("SWITCH",
-                             f"N{k[0]}↔N{k[1]} failback LoRa → ESP-NOW  "
-                             f"(ESP-NOW stable at {pref.ewma:.0f} dBm for {FAILBACK_TICKS*TICK:.0f}s)")
-
-    # ---- routing
-    def compute_routes(self, initial=False):
-        dist, parent, pq = {1: 0.0}, {}, [(0.0, 1)]
-        while pq:
-            d, u = heapq.heappop(pq)
-            if d > dist.get(u, 1e9):
-                continue
-            for v in self.adj[u]:
-                l = self.edge(u, v)
-                if not l:
-                    continue
-                nd = d + self.cost(l)
-                if nd < dist.get(v, 1e9) - 1e-9:
-                    dist[v], parent[v] = nd, u
-                    heapq.heappush(pq, (nd, v))
-
-        for src in (2, 3, 4):
-            new = None
-            if src in dist:
-                new = [src]
-                while new[-1] != 1:
-                    new.append(parent[new[-1]])
-            cur = self.routes.get(src)
-            keep = None
-            if cur:
-                c = self.path_cost(cur["path"])
-                if c is not None and (new is None or c <= dist[src] + 0.75):
-                    keep = c
-            if keep is not None:                         # hysteresis: stay on the current path
-                cur["cost"] = keep
-                cur["proto"] = self.edge(cur["path"][0], cur["path"][1]).proto
-                continue
-            if new is None:
-                if cur is not None:
-                    self.log("CRIT", f"Route N{src}→N1 lost: no usable path")
-                    self.route_changes += 1
-                    del self.routes[src]
-                continue
-            first = self.edge(new[0], new[1])
-            route = dict(path=new, cost=dist[src], proto=first.proto,
-                         seq=(cur["seq"] + 1 if cur else 1), changed=self.t)
-            if cur and not initial:
-                self.route_changes += 1
-                self.log("ROUTE", f"Route N{src}→N1: {fmt_path(cur['path'])} ⇒ {fmt_path(new)}  "
-                                  f"(metric {route['cost']:.1f})")
-            elif not cur and not initial:
-                self.route_changes += 1
-                self.log("ROUTE", f"Route N{src}→N1 restored: {fmt_path(new)}")
-            self.routes[src] = route
-
-    def path_cost(self, path):
-        total = 0.0
-        for u, v in zip(path, path[1:]):
-            l = self.edge(u, v)
-            if l is None:
-                return None
-            total += self.cost(l)
-        return total
-
-    # ---- data plane
-    def traffic(self):
-        hops = deliv = 0
-        for src in (2, 3, 4):
-            if random.random() > 0.45:
-                continue
-            n = self.nodes[src]
-            n.tx += 1
-            self.sent += 1
-            r = self.routes.get(src)
-            if not r:
-                n.drop += 1
-                continue
-            lat, ok, last = 0.0, True, None
-            for u, v in zip(r["path"], r["path"][1:]):
-                l = self.edge(u, v)
-                if l is None:
-                    self.nodes[u].drop += 1
-                    ok = False
-                    break
-                ps = self.proto[l.proto]
-                ps["tx"] += 1
-                hops += 1
-                if random.random() < 1.0 - (1.0 - l.pdr) ** 2:        # one retry per hop
-                    ps["rx"] += 1
-                    self.nodes[v].rx += 1
-                    if v != 1:
-                        self.nodes[v].fwd += 1
-                    hl = random.uniform(*PROTO[l.proto]["lat"])
-                    lat += hl
-                    ps["lat"] = hl if ps["lat"] is None else 0.9 * ps["lat"] + 0.1 * hl
-                    last = (u, l.proto)
-                else:
-                    ps["drop"] += 1
-                    self.nodes[u].drop += 1
-                    ok = False
-                    break
-            if ok:
-                deliv += 1
-                self.delivered += 1
-                n.delivered += 1
-                n.rx += 1                                   # ACK back from the gateway
-                self.nodes[1].tx += 1
-                self.e2e_lat = lat if self.e2e_lat is None else 0.9 * self.e2e_lat + 0.1 * lat
-        self.window.append((hops, deliv))
-
-    def refresh_neighbors(self):
-        """A hello beacon received from a direct neighbor refreshes its entry."""
-        for v, e in self.neigh.items():
-            l = self.edge(1, v)
-            if l and l.miss == 0:
-                e.update(seen=self.t, proto=l.proto, rssi=l.raw, ewma=l.ewma)
-
-    def step(self):
-        if self.paused:
-            return
-        self.t += TICK
-        for l in self.links:
-            self.sample_link(l)
-        self.evaluate_pairs()
-        self.compute_routes()
-        self.traffic()
-        self.refresh_neighbors()
-
-    def used_edges(self):
-        used = set()
-        for r in self.routes.values():
-            for u, v in zip(r["path"], r["path"][1:]):
-                used.add((min(u, v), max(u, v), self.active.get((min(u, v), max(u, v)), "ESP-NOW")))
-        return used
 
 
 # --------------------------------------------------------------------------- rendering (live boards)
@@ -405,7 +61,7 @@ DEFAULT_DEST_ID = 1         # config.h: data destination a board starts with
 LINK_RANK = {"HEALTHY": 0, "DEGRADING": 1, "DEAD": 2}
 LINK_STYLE = {"HEALTHY": "green", "DEGRADING": "yellow", "DEAD": "bold white on red"}
 LINK_LETTER = {"HEALTHY": "H", "DEGRADING": "D", "DEAD": "X"}
-LIVE_LEVEL_STYLE = {"INFO": "cyan", "OK": "green", "WARN": "yellow", "CRIT": "bold red", "ROUTE": "bright_blue"}
+LEVEL_STYLE = {"INFO": "cyan", "OK": "green", "WARN": "yellow", "CRIT": "bold red", "ROUTE": "bright_blue"}
 
 
 def bar(v, width=10):
@@ -560,7 +216,7 @@ def events_panel(m):
     t.add_column(width=6)
     t.add_column(overflow="fold")
     for stamp, level, msg in list(m.events)[::-1][:40]:
-        style = LIVE_LEVEL_STYLE.get(level, "white")
+        style = LEVEL_STYLE.get(level, "white")
         t.add_row(stamp, f"[{style}]{level}[/]", Text(msg, style=style if level == "CRIT" else ""))
     return Panel(t, title="[bold]EVENT LOG[/]  [dim]newest first[/]", border_style="cyan")
 
@@ -589,13 +245,38 @@ def paths_panel(m):
     return Panel(out, title="[bold]ACTIVE PATHS[/]", border_style="blue")
 
 
-def render(m, now, mode="LIVE"):
+def anomaly_panel(m, anomalies):
+    t = Table(box=None, show_header=False, expand=True, padding=(0, 1, 0, 0))
+    t.add_column(style="bold", no_wrap=True)
+    t.add_column(no_wrap=True)
+    t.add_column(justify="right", style="dim")
+    t.add_column(no_wrap=True)
+    totals = {}
+    for b in sorted_boards(m):
+        pair = anomalies.sensors.get(b.node_id) if anomalies and b.node_id is not None else None
+        if not pair:
+            continue
+        for i, s in enumerate(pair, 1):
+            names = flag_names(s.shown_flags)
+            flag = Text(" ".join(names), style="bold red") if names else Text("ok", style="dim green")
+            label = f"{b.label} s{i}" if i == 1 else " " * len(b.label) + f" s{i}"
+            t.add_row(label, Text(spark(s.hist, 0, 4095, width=8), style="yellow"), str(s.value), flag)
+            for name, c in s.counts.items():
+                totals[name] = totals.get(name, 0) + c
+    body = [t] if t.row_count else [Text("waiting for boards…", style="dim")]
+    if totals:
+        body.append(Text("flagged: " + " · ".join(f"{k} {v}" for k, v in totals.items()), style="dim"))
+    return Panel(Group(*body), title="[bold]ANOMALY[/] [bold black on yellow] DEMO [/]",
+                 subtitle="[dim]generated · no sensors[/]", border_style="yellow")
+
+
+def render(m, now, mode="LIVE", anomalies=None):
     root = Layout()
     root.split_column(Layout(name="head", size=3), Layout(name="top", ratio=10),
                       Layout(name="mid", ratio=9), Layout(name="bot", ratio=9), Layout(name="foot", size=3))
     boards = list(m.boards.values())
-    live = sum(1 for b in boards if b.connected and not b.stale(now)) if mode == "LIVE" else \
-        sum(1 for b in boards if b.table_time is not None)
+    live = sum(1 for b in boards if b.table_time is not None) if mode == REPLAY_MODE else \
+        sum(1 for b in boards if b.connected and not b.stale(now))
     states = [n.state for b in boards if not b.stale(now) for n in b.neighbors.values()]
     worst = max((LINK_RANK[s] for s in states), default=None)
     worst_name = "—" if worst is None else ["HEALTHY", "DEGRADING", "DEAD"][worst]
@@ -613,44 +294,62 @@ def render(m, now, mode="LIVE"):
     root["top"].split_row(Layout(boards_panel(m, now), size=56), Layout(links_panel(m, now)))
     root["mid"].split_row(Layout(routes_panel(m), ratio=7), Layout(neighbors_panel(m), ratio=3),
                           Layout(traffic_panel(m), ratio=4))
-    root["bot"].split_row(Layout(events_panel(m), ratio=3), Layout(paths_panel(m), ratio=2))
+    root["bot"].split_row(Layout(events_panel(m), ratio=5), Layout(paths_panel(m), ratio=4),
+                          Layout(anomaly_panel(m, anomalies), ratio=3))
     root["foot"].update(Panel("[bold cyan]Ctrl+C[/] Quit", border_style="blue", padding=(0, 1)))
     return root
 
 
 # --------------------------------------------------------------------------- main
+def run(mesh, mode):
+    """Screen loop: drain the readers, step the DEMO sensors once a second, redraw."""
+    console = Console()
+    anomalies = DemoAnomalies()
+    next_sample = 0.0
+    try:
+        with Live(render(mesh, time.time(), mode, anomalies), console=console, screen=True,
+                  auto_refresh=False) as live:
+            while True:
+                started = time.monotonic()
+                mesh.poll()
+                if started >= next_sample:
+                    anomalies.step(mesh.by_id())
+                    next_sample = started + 1.0
+                live.update(render(mesh, time.time(), mode, anomalies), refresh=True)
+                time.sleep(max(0.0, TICK - (time.monotonic() - started)))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        mesh.stop()
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Terminal dashboard for the ESP-NOW mesh boards.")
-    ap.add_argument("--ports", nargs="+", metavar="COM", help="one serial port per board, e.g. COM3 COM4")
-    ap.add_argument("--replay", nargs="+", metavar="FILE",
-                    help="print one frame from recorded serial captures (one file per board) and exit")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--ports", nargs="+", metavar="COM", help="one serial port per board, e.g. COM3 COM4")
+    src.add_argument("--demo", action="store_true", help="simulated boards (SIM on screen), no hardware needed")
+    src.add_argument("--replay", nargs="+", metavar="FILE",
+                     help="print one frame from recorded serial captures (one file per board) and exit")
     args = ap.parse_args(argv)
     if hasattr(sys.stdout, "reconfigure"):      # redirected output on Windows defaults to cp1252 (no ●, █, →)
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     if args.replay:
         mesh = replay(args.replay)
+        anomalies = DemoAnomalies()
+        for _ in range(HIST_LEN):
+            anomalies.step(mesh.by_id())
         console = Console()
-        console.print(render(mesh, replay_now(mesh), mode="REPLAY (recorded lines, not live)"),
-                      height=max(42, console.size.height))
-        return
-    if not args.ports:
-        ap.error("give the boards' ports, e.g. --ports COM3 COM4 COM5 COM6")
-
-    console = Console()
-    mesh = LiveMesh(args.ports)
-    mesh.start()
-    try:
-        with Live(render(mesh, time.time()), console=console, screen=True, auto_refresh=False) as live:
-            while True:
-                started = time.monotonic()
-                mesh.poll()
-                live.update(render(mesh, time.time()), refresh=True)
-                time.sleep(max(0.0, TICK - (time.monotonic() - started)))
-    except KeyboardInterrupt:
-        pass
-    finally:
-        mesh.stop()
+        console.print(render(mesh, replay_now(mesh), REPLAY_MODE, anomalies), height=max(42, console.size.height))
+    elif args.demo:
+        sim = SimMesh()
+        mesh = LiveMesh(sim.ports)
+        mesh.start(opener=sim.open)             # same SerialReader path as real ports
+        run(mesh, SIM_MODE)
+    else:
+        mesh = LiveMesh(args.ports)
+        mesh.start()
+        run(mesh, "LIVE")
 
 
 if __name__ == "__main__":
