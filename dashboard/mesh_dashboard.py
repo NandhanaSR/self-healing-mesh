@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
-"""meshctl - live terminal dashboard for a 4-node hybrid ESP-NOW / LoRa mesh.
+"""meshctl - live terminal dashboard for the predictive self-healing ESP-NOW mesh.
 
-Nodes 1 and 2 carry both radios. The N1<->N2 hop prefers ESP-NOW and fails over
-to LoRa when the link health (RSSI EWMA + loss) goes critical, then fails back
-once ESP-NOW has been healthy for a while.
+Reads each board's serial output (one COM port per board) and shows what the boards
+report: link state, ewma, slope, PRR/dPRR, q and q_pred per link, and each board's
+next hop / priority next hop per destination. Nothing is recomputed in Python.
 
-Run:   pip install rich && python3 mesh_dashboard.py
-Keys:  q quit | p pause | f toggle ESP-NOW N1-N2 interference | g toggle LoRa N1-N2 interference
-Best viewed in a terminal of at least 140x42.
+Run:   pip install rich pyserial
+       python dashboard/mesh_dashboard.py --ports COM3 COM4 COM5 COM6
+       python dashboard/mesh_dashboard.py --replay dashboard/samples/mesh4/node*.txt   (one frame, no boards)
+Keys:  Ctrl+C quit
+Best viewed in Windows Terminal of at least 140x42.
 """
 from __future__ import annotations
 
+import argparse
 import heapq
 import math
-import os
 import random
-import select
 import sys
 import time
 from collections import deque
 
 try:
     from rich import box
-    from rich.console import Console
+    from rich.console import Console, Group
     from rich.layout import Layout
     from rich.live import Live
     from rich.panel import Panel
@@ -32,11 +33,7 @@ except ImportError:
     print("Missing dependency: pip install rich", file=sys.stderr)
     raise SystemExit(2)
 
-try:
-    import termios
-    import tty
-except ImportError:  # non-POSIX
-    termios = None
+from live_model import MAX_NODES, LiveMesh, replay, replay_now
 
 # --------------------------------------------------------------------------- config
 TICK = 0.25                 # seconds per update
@@ -398,116 +395,163 @@ class Mesh:
         return used
 
 
-# --------------------------------------------------------------------------- rendering
+# --------------------------------------------------------------------------- rendering (live boards)
+# Every number below is as printed by a board (via live_model.LiveMesh); nothing is recomputed.
+Q_TH = 0.50                 # config.h: q_pred below this -> DEGRADING (used for colour only)
+Q_RECOVER = 0.65            # config.h: back to HEALTHY above this
+RSSI_MIN, RSSI_MAX = -85, -40   # config.h: RSSI score range, used to scale the ewma sparkline
+DEFAULT_DEST_ID = 1         # config.h: data destination a board starts with
+
+LINK_RANK = {"HEALTHY": 0, "DEGRADING": 1, "DEAD": 2}
+LINK_STYLE = {"HEALTHY": "green", "DEGRADING": "yellow", "DEAD": "bold white on red"}
+LINK_LETTER = {"HEALTHY": "H", "DEGRADING": "D", "DEAD": "X"}
+LIVE_LEVEL_STYLE = {"INFO": "cyan", "OK": "green", "WARN": "yellow", "CRIT": "bold red", "ROUTE": "bright_blue"}
+
+
 def bar(v, width=10):
     n = int(round(v / 100.0 * width))
     return "█" * n + "░" * (width - n)
 
 
-def nodes_panel(m):
-    t = Table(box=box.SIMPLE_HEAVY, expand=True, header_style="bold bright_cyan", pad_edge=False)
-    for col, kw in (("NODE", dict(width=4)), ("ROLE", dict(width=8)), ("RADIOS", dict(min_width=14)),
-                    ("STATUS", dict(width=9)), ("TX", dict(justify="right")), ("RX", dict(justify="right")),
-                    ("FWD", dict(justify="right")), ("DROP", dict(justify="right")), ("PDR", dict(justify="right"))):
-        t.add_column(col, **kw)
-    for n, info in NODES.items():
-        alive = any(m.edge(n, v) for v in m.adj[n])
-        st = m.nodes[n]
-        if n == 1:
-            pdr = f"{100.0 * m.delivered / m.sent:.1f}%" if m.sent else "—"
-        else:
-            pdr = f"{100.0 * st.delivered / st.tx:.1f}%" if st.tx else "—"
-        t.add_row(f"N{n}", info["role"], info["radios"],
-                  "[green]● ONLINE[/]" if alive else "[bold red]○ ISOLATED[/]",
-                  str(st.tx), str(st.rx), str(st.fwd), str(st.drop), pdr)
-    return Panel(t, title="[bold]NODES[/]  [dim]packets per node · PDR = delivered / originated[/]", border_style="cyan")
+def q_style(q_pred):
+    return "bold red" if q_pred < Q_TH else "yellow" if q_pred < Q_RECOVER else "green"
 
 
-def links_panel(m):
-    t = Table(box=box.SIMPLE_HEAVY, expand=True, header_style="bold bright_cyan", pad_edge=False)
-    for col, kw in (("LINK", dict(width=7)), ("RADIO", dict(width=8)), ("ROLE", dict(width=8)),
-                    ("RSSI", dict(justify="right", width=5)), ("EWMA", dict(justify="right", width=7)),
-                    ("TREND", dict(width=14)), ("LOSS", dict(justify="right", width=6)),
-                    ("HEALTH", dict(min_width=15)), ("STATE", dict(width=9))):
+def sorted_boards(m):
+    return sorted(m.boards.values(), key=lambda b: (b.node_id is None, b.node_id or 0, b.port))
+
+
+def board_status(b, now):
+    if not b.connected and b.table_time is None:
+        return "[bold red]○ OFFLN[/]"
+    if b.table_time is None:
+        return "[dim]… waiting[/]"
+    if not b.connected:
+        return "[bold red]○ LOST[/]"
+    if b.stale(now):
+        return "[yellow]◌ STALE[/]"
+    return "[green]● LIVE[/]"
+
+
+def boards_panel(m, now):
+    t = Table(box=box.SIMPLE_HEAVY, expand=True, header_style="bold bright_cyan", pad_edge=False, padding=(0, 1, 0, 0), show_edge=False)
+    for col, kw in (("NODE", dict(width=4)), ("PORT", dict(min_width=5)), ("STATUS", dict(width=9)),
+                    ("DEST", dict(justify="right", width=4)), ("PRIO", dict(justify="right", width=4)),
+                    ("FWD", dict(justify="right")), ("NO RT", dict(justify="right", width=5)),
+                    ("DATA", dict(justify="right"))):
         t.add_column(col, **kw)
-    used = m.used_edges()
-    for l in sorted(m.links, key=lambda x: (x.a, x.b, x.proto)):
-        dual = (l.a, l.b) in m.active
-        if dual:
-            role = "ACTIVE" if m.active[(l.a, l.b)] == l.proto else "STANDBY"
-        else:
-            role = "ACTIVE" if (l.a, l.b, l.proto) in used else "IDLE"
-        rstyle = {"ACTIVE": "bold white", "STANDBY": "dim", "IDLE": "dim"}[role]
-        p = PROTO[l.proto]
-        sst = STATE_STYLE[l.state]
-        raw = f"{l.raw}" + ("·" if l.miss > 2 else "")
-        t.add_row(l.name, f"[{p['color']}]{l.proto}[/]", f"[{rstyle}]{role}[/]", raw,
-                  f"{l.ewma:.1f}", f"[{sst}]{spark(l.hist, p['floor'], p['good'])}[/]",
-                  f"{l.loss*100:.1f}%", f"[{sst}]{bar(l.health)}[/] {l.health:3.0f}",
-                  f"[{sst}]{l.state}[/]")
-    return Panel(t, title="[bold]LINK HEALTH[/]  [dim]RSSI dBm · EWMA α=0.20 · ·=no recent frame[/]", border_style="cyan")
+    for b in sorted_boards(m):
+        node = f"N{b.node_id}" if b.node_id is not None else "?"
+        dest = "?" if b.dest is None else f"N{b.dest}"
+        prio = "?" if b.priority is None else ("[bold magenta]ON[/]" if b.priority else "[dim]off[/]")
+        no_rt = f"[bold red]{b.no_route}[/]" if b.no_route else "0"
+        t.add_row(node, b.port, board_status(b, now), dest, prio, str(b.fwd), no_rt, str(b.delivered))
+    return Panel(t, title="[bold]BOARDS[/]  [dim]counts = serial lines · ? = not printed yet[/]",
+                 border_style="cyan")
+
+
+def links_panel(m, now):
+    t = Table(box=box.SIMPLE_HEAVY, expand=True, header_style="bold bright_cyan", pad_edge=False, padding=(0, 1, 0, 0), show_edge=False)
+    for col, kw in (("LINK", dict(no_wrap=True)), ("STATE", dict(width=9)), ("EWMA", dict(justify="right", width=6)),
+                    ("TREND", dict(width=8)), ("SLOPE", dict(justify="right")),
+                    ("PRR", dict(justify="right")), ("dPRR", dict(justify="right")),
+                    ("HEALTH q", dict(width=10)), ("Q_PRED", dict(width=11))):
+        t.add_column(col, **kw)
+    for b in sorted_boards(m):
+        dim = " dim" if b.stale(now) else ""
+        for n in sorted(b.neighbors.values(), key=lambda x: x.nbr):
+            sst = LINK_STYLE[n.state]
+            qst = q_style(n.q_pred)
+            slope = f"[red]{n.slope:.2f}[/]" if n.slope < 0 else f"{n.slope:.2f}"
+            dprr = f"[red]{n.dprr:.2f}[/]" if n.dprr < 0 else f"{n.dprr:.2f}"
+            t.add_row(f"[bold{dim}]{b.label}→N{n.nbr}[/]", f"[{sst}]{n.state}[/]", f"{n.ewma:.1f}",
+                      f"[{sst}]{spark(b.ewma_hist.get(n.nbr, ()), RSSI_MIN, RSSI_MAX, width=8)}[/]",
+                      slope, f"{n.prr:.2f}", dprr, f"[{sst}]{bar(n.q, width=6)}[/] {n.q:3d}",
+                      f"[{qst}]{n.q_pred:.2f} {spark(b.qpred_hist.get(n.nbr, ()), 0.0, 1.0, width=6)}[/]")
+    return Panel(t if t.row_count else Text("no link data yet", style="dim"), title=f"[bold]LINK HEALTH[/]  [dim]as measured by each board · ewma dBm · slope dB/s · "
+                          f"q_pred < {Q_TH:.2f} → DEGRADING[/]",
+                 border_style="cyan")
+
+
+def path_text(m, nodes, status):
+    """N0 ─0.91→ N2 ─0.94→ N1, each hop coloured by the link state the sending board measures."""
+    boards = m.by_id()
+    out = Text()
+    for i, n in enumerate(nodes):
+        out.append(f"N{n}", style="bold bright_white")
+        if i + 1 < len(nodes):
+            b = boards.get(n)
+            link = b.neighbors.get(nodes[i + 1]) if b else None
+            if link:
+                out.append(f" ─{link.q_pred:.2f}→ ", style=LINK_STYLE[link.state])
+            else:
+                out.append(" ─?→ ", style="dim")
+    if status == "no-route":
+        out.append("  ✗ no route", style="bold red")
+    elif status == "unknown":
+        out.append("  … board not connected", style="dim")
+    elif status == "loop":
+        out.append("  ⟲ loop", style="bold red")
+    return out
 
 
 def routes_panel(m):
-    t = Table(box=box.SIMPLE_HEAVY, expand=True, header_style="bold bright_cyan", pad_edge=False)
-    for col, kw in (("DEST", dict(width=5)), ("NEXT", dict(width=5)), ("IFACE", dict(width=8)),
-                    ("HOPS", dict(justify="right", width=4)), ("PATH", dict(min_width=14)),
-                    ("METRIC", dict(justify="right", width=6)), ("SEQ", dict(justify="right", width=3)),
-                    ("AGE", dict(justify="right", width=6))):
+    t = Table(box=box.SIMPLE_HEAVY, expand=True, header_style="bold bright_cyan", pad_edge=False, collapse_padding=True)
+    for col, kw in (("AT", dict(width=3)), ("DEST", dict(width=5)), ("NEXT", dict(width=4)),
+                    ("COST", dict(justify="right", width=5)), ("PRIO", dict(width=4)),
+                    ("HOPS", dict(justify="right", width=4)), ("PATH (next hops)", dict(min_width=16, overflow="fold"))):
         t.add_column(col, **kw)
-    t.add_row("N1", "local", "—", "0", "N1", "0.0", "—", "—")
-    for src in (2, 3, 4):
-        r = m.routes.get(src)
-        if not r:
-            t.add_row(f"[bold red]N{src}[/]", "—", "—", "—", "[bold red]no route[/]", "—", "—", "—")
+    for b in sorted_boards(m):
+        if b.table_time is None:
             continue
-        col = PROTO[r["proto"]]["color"]
-        t.add_row(f"N{src}", f"N{r['path'][1]}", f"[{col}]{r['proto']}[/]", str(len(r["path"]) - 1),
-                  fmt_path(r["path"]), f"{r['cost']:.1f}", str(r["seq"]), f"{m.t - r['changed']:.0f}s")
-    return Panel(t, title="[bold]ROUTING TABLE[/]  [dim]to gateway N1 · metric = link cost[/]", border_style="blue")
+        if not b.routes:
+            t.add_row(b.label, "[dim]no routes[/]", "", "", "", "", "")
+        for r in sorted(b.routes.values(), key=lambda x: x.dest):
+            star = "★" if r.dest == b.dest else " "
+            prio = f"[bold magenta]N{r.prio_next}[/]" if r.prio_next != r.next else f"N{r.prio_next}"
+            t.add_row(b.label, f"{star}N{r.dest}", f"N{r.next}", f"{r.cost:.2f}", prio, str(r.hops),
+                      path_text(m, *m.path(b.node_id, r.dest)))
+    return Panel(t if t.row_count else Text("no routing tables yet", style="dim"), title="[bold]ROUTING[/]  [dim]each board's table · PRIO = priority next hop · ★ = data destination[/]", border_style="blue")
 
 
-def neighbor_panel(m):
-    t = Table(box=box.SIMPLE_HEAVY, expand=True, header_style="bold bright_cyan", pad_edge=False)
-    for col, kw in (("ID", dict(width=3)), ("MAC", dict(min_width=17)), ("IFACE", dict(width=8)),
-                    ("RSSI", dict(justify="right", width=5)), ("EWMA", dict(justify="right", width=6)),
-                    ("AGE", dict(justify="right", width=5)), ("STATE", dict(width=9))):
-        t.add_column(col, **kw)
-    for n in sorted(m.neigh):
-        e = m.neigh[n]
-        mac = f"24:6F:28:A{n}:5C:{n:02X}"
-        if e["seen"] is None:
-            t.add_row(f"N{n}", mac, "—", "—", "—", "—", "[dim]UNKNOWN[/]")
+def neighbors_panel(m):
+    t = Table(box=box.SIMPLE_HEAVY, header_style="bold bright_cyan", pad_edge=False, padding=(0, 0), show_edge=False)
+    t.add_column("", width=3)
+    for i in range(MAX_NODES):
+        t.add_column(f"N{i}", justify="center")
+    for b in sorted_boards(m):
+        if b.node_id is None:
             continue
-        age = m.t - e["seen"]
-        state = "[green]REACHABLE[/]" if age < 2 else "[yellow]STALE[/]" if age < 6 else "[bold red]FAILED[/]"
-        col = PROTO[e["proto"]]["color"]
-        t.add_row(f"N{n}", mac, f"[{col}]{e['proto']}[/]", str(e["rssi"]), f"{e['ewma']:.1f}",
-                  f"{age:.1f}s", state)
-    return Panel(t, title="[bold]NEIGHBOR TABLE[/]  [dim]N1 · learned from hello beacons[/]", border_style="blue")
+        cells = []
+        for i in range(MAX_NODES):
+            n = b.neighbors.get(i)
+            if i == b.node_id:
+                cells.append("[dim]—[/]")
+            elif n:
+                cells.append(f"[{LINK_STYLE[n.state]}]{LINK_LETTER[n.state]}[/]")
+            else:
+                cells.append("[dim]·[/]")
+        t.add_row(f"[bold]{b.label}[/]", *cells)
+    legend = Text("\nrow sees col\nH healthy · D degrading\nX dead", style="dim")
+    return Panel(Group(t, legend), title="[bold]NEIGHBORS[/]", border_style="blue")
 
 
-def packets_panel(m):
-    t = Table(box=box.SIMPLE_HEAVY, expand=True, show_header=False, padding=(0, 1))
+def traffic_panel(m):
+    t = Table(box=box.SIMPLE_HEAVY, expand=True, show_header=False, padding=(0, 1), show_edge=False)
     t.add_column(style="dim")
     t.add_column(justify="right", style="bold")
-    tx = sum(p["tx"] for p in m.proto.values())
-    rx = sum(p["rx"] for p in m.proto.values())
-    dr = sum(p["drop"] for p in m.proto.values())
-    win_t = max(1, len(m.window)) * TICK
-    rate = sum(h for h, _ in m.window) / win_t
-    t.add_row("Hop TX / RX / drop", f"{tx} / {rx} / {dr}")
-    t.add_row("End-to-end delivery", f"{100.0*m.delivered/m.sent:.1f}%" if m.sent else "—")
-    t.add_row("Throughput", f"{rate:.1f} pkt/s")
-    t.add_row("E2E latency (EWMA)", f"{m.e2e_lat:.0f} ms" if m.e2e_lat else "—")
-    for name, p in m.proto.items():
-        c = PROTO[name]["color"]
-        loss = f"{100.0*p['drop']/p['tx']:.1f}%" if p["tx"] else "—"
-        lat = f"{p['lat']:.0f} ms" if p["lat"] else "—"
-        t.add_row(f"[{c}]{name}[/] tx/rx · loss", f"{p['tx']}/{p['rx']} · {loss}")
-        t.add_row(f"[{c}]{name}[/] hop latency", lat)
-    t.add_row("Handovers / route changes", f"{m.handovers} / {m.route_changes}")
-    return Panel(t, title="[bold]PACKET STATS[/]", border_style="magenta")
+    boards = list(m.boards.values())
+    fwd = sum(b.fwd for b in boards)
+    t.add_row("FWD (prio)", f"{fwd} ({sum(b.fwd_prio for b in boards)})")
+    t.add_row("No route", str(sum(b.no_route for b in boards)))
+    for b in sorted_boards(m):
+        if b.delivered:
+            per_src = " ".join(f"N{s}:{c}" for s, c in sorted(b.delivered_from.items()))
+            t.add_row(f"DATA at {b.label}", str(b.delivered))
+            t.add_row("  from", f"[dim]{per_src}[/]")
+    t.add_row("Link changes", str(m.link_changes))
+    t.add_row("Route changes", str(m.route_changes))
+    return Panel(t, title="[bold]TRAFFIC[/]  [dim]serial lines since start[/]", border_style="magenta")
 
 
 def events_panel(m):
@@ -516,101 +560,97 @@ def events_panel(m):
     t.add_column(width=6)
     t.add_column(overflow="fold")
     for stamp, level, msg in list(m.events)[::-1][:40]:
-        t.add_row(stamp, f"[{LEVEL_STYLE[level]}]{level}[/]", f"[{LEVEL_STYLE[level]}]{msg}[/]"
-                  if level in ("CRIT", "SWITCH") else msg)
+        style = LIVE_LEVEL_STYLE.get(level, "white")
+        t.add_row(stamp, f"[{style}]{level}[/]", Text(msg, style=style if level == "CRIT" else ""))
     return Panel(t, title="[bold]EVENT LOG[/]  [dim]newest first[/]", border_style="cyan")
 
 
-def topology_panel(m):
+def paths_panel(m):
     out = Text()
-    for n in (1, 2, 3, 4):
-        node = f"N{n}"
-        out.append(f" ● {node}", style="bold bright_white")
-        out.append(f"  {NODES[n]['role'].lower()}\n", style="dim")
-        if n == 4:
-            break
-        l = m.edge(n, n + 1)
-        if l is None:
-            out.append("  ╳  link down\n", style="bold white on red")
+    for b in sorted_boards(m):
+        if b.node_id is None or b.table_time is None:
             continue
-        c = PROTO[l.proto]["color"]
-        glyph = "║" if l.proto == "LoRa" else "│"
-        out.append(f"  {glyph} ", style=c)
-        out.append(f"{l.proto}", style=f"bold {c}")
-        out.append(f"  {l.ewma:.0f} dBm  ", style=STATE_STYLE[l.state])
-        out.append(f"{l.state}\n", style=STATE_STYLE[l.state])
-    out.append("\n W/ESP-NOW = green   LoRa = magenta", style="dim")
-    return Panel(out, title="[bold]ACTIVE CHAIN[/]", border_style="blue")
+        dest = b.dest if b.dest is not None else DEFAULT_DEST_ID
+        if dest == b.node_id:
+            continue
+        guess = "" if b.dest is not None else "?"       # dest not printed yet: firmware default assumed
+        out.append(f" {b.label}→N{dest}{guess}  ", style="bold")
+        out.append_text(path_text(m, *m.path(b.node_id, dest)))
+        out.append("\n")
+        prio_nodes, prio_status = m.path(b.node_id, dest, priority=True)
+        if prio_nodes != m.path(b.node_id, dest)[0] or b.priority:
+            out.append("   prio  ", style="magenta" if b.priority else "dim magenta")
+            out.append_text(path_text(m, prio_nodes, prio_status))
+            out.append("\n")
+    if not out.plain:
+        out.append(" waiting for routing tables…", style="dim")
+    out.append(f"\n number = q_pred of the hop · ? = destination not printed yet (default N{DEFAULT_DEST_ID})",
+               style="dim")
+    return Panel(out, title="[bold]ACTIVE PATHS[/]", border_style="blue")
 
 
-def render(m, console):
+def render(m, now, mode="LIVE"):
     root = Layout()
     root.split_column(Layout(name="head", size=3), Layout(name="top", ratio=10),
                       Layout(name="mid", ratio=9), Layout(name="bot", ratio=9), Layout(name="foot", size=3))
-    online = sum(1 for n in NODES if any(m.edge(n, v) for v in m.adj[n]))
-    worst = max((STATE_RANK[l.state] for l in m.links if (l.a, l.b, l.proto) in m.used_edges()), default=0)
-    mesh_state = ["HEALTHY", "DEGRADED", "CRITICAL", "DOWN"][worst]
-    mcol = ["green", "yellow", "red", "red"][worst]
-    title = Text("meshctl  /  hybrid ESP-NOW + LoRa mesh", style="bold bright_white")
-    title.append(f"   ● MESH {mesh_state}", style=f"bold {mcol}")
-    title.append(f"   {online}/{len(NODES)} nodes", style="dim")
-    title.append(f"   uptime {int(m.t - m.t0):>4}s", style="dim")
-    title.append(f"   {time.strftime('%H:%M:%S')}", style="dim")
-    if m.paused:
-        title.append("   [PAUSED]", style="bold yellow")
-    root["head"].update(Panel(title, border_style=mcol, padding=(0, 1)))
+    boards = list(m.boards.values())
+    live = sum(1 for b in boards if b.connected and not b.stale(now)) if mode == "LIVE" else \
+        sum(1 for b in boards if b.table_time is not None)
+    states = [n.state for b in boards if not b.stale(now) for n in b.neighbors.values()]
+    worst = max((LINK_RANK[s] for s in states), default=None)
+    worst_name = "—" if worst is None else ["HEALTHY", "DEGRADING", "DEAD"][worst]
+    wcol = "dim" if worst is None else ["green", "yellow", "red"][worst]
+    title = Text("meshctl  /  predictive ESP-NOW mesh", style="bold bright_white")
+    if mode == "LIVE":
+        title.append("   ● LIVE", style="bold green")
+    else:
+        title.append(f"   ▶ {mode}", style="bold black on yellow")
+    title.append(f"   worst link {worst_name}", style=f"bold {wcol}")
+    title.append(f"   {live}/{len(boards)} boards", style="dim")
+    title.append(f"   {time.strftime('%H:%M:%S', time.localtime(now))}", style="dim")
+    root["head"].update(Panel(title, border_style=wcol if worst is not None else "blue", padding=(0, 1)))
 
-    root["top"].split_row(Layout(nodes_panel(m), ratio=5), Layout(links_panel(m), ratio=8))
-    root["mid"].split_row(Layout(routes_panel(m), ratio=5), Layout(neighbor_panel(m), ratio=5),
-                          Layout(packets_panel(m), ratio=4))
-    root["bot"].split_row(Layout(events_panel(m), ratio=3), Layout(topology_panel(m), ratio=1))
-    root["foot"].update(Panel(
-        "[bold cyan]q[/] Quit   [bold cyan]p[/] Pause   "
-        "[bold cyan]f[/] Toggle ESP-NOW N1↔N2 interference   [bold cyan]g[/] Toggle LoRa N1↔N2 interference",
-        border_style="blue", padding=(0, 1)))
+    root["top"].split_row(Layout(boards_panel(m, now), size=56), Layout(links_panel(m, now)))
+    root["mid"].split_row(Layout(routes_panel(m), ratio=7), Layout(neighbors_panel(m), ratio=3),
+                          Layout(traffic_panel(m), ratio=4))
+    root["bot"].split_row(Layout(events_panel(m), ratio=3), Layout(paths_panel(m), ratio=2))
+    root["foot"].update(Panel("[bold cyan]Ctrl+C[/] Quit", border_style="blue", padding=(0, 1)))
     return root
 
 
 # --------------------------------------------------------------------------- main
-def read_keys(fd):
-    keys = []
-    while select.select([fd], [], [], 0)[0]:
-        data = os.read(fd, 32)
-        if not data:
-            break
-        keys.extend(chr(c).lower() for c in data)
-    return keys
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Terminal dashboard for the ESP-NOW mesh boards.")
+    ap.add_argument("--ports", nargs="+", metavar="COM", help="one serial port per board, e.g. COM3 COM4")
+    ap.add_argument("--replay", nargs="+", metavar="FILE",
+                    help="print one frame from recorded serial captures (one file per board) and exit")
+    args = ap.parse_args(argv)
+    if hasattr(sys.stdout, "reconfigure"):      # redirected output on Windows defaults to cp1252 (no ●, █, →)
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
+    if args.replay:
+        mesh = replay(args.replay)
+        console = Console()
+        console.print(render(mesh, replay_now(mesh), mode="REPLAY (recorded lines, not live)"),
+                      height=max(42, console.size.height))
+        return
+    if not args.ports:
+        ap.error("give the boards' ports, e.g. --ports COM3 COM4 COM5 COM6")
 
-def main():
     console = Console()
-    mesh = Mesh()
-    fd, old = None, None
-    if termios and sys.stdin.isatty():
-        fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
-        tty.setcbreak(fd)
+    mesh = LiveMesh(args.ports)
+    mesh.start()
     try:
-        with Live(render(mesh, console), console=console, screen=True, auto_refresh=False) as live:
+        with Live(render(mesh, time.time()), console=console, screen=True, auto_refresh=False) as live:
             while True:
                 started = time.monotonic()
-                for k in (read_keys(fd) if fd is not None else []):
-                    if k == "q":
-                        return
-                    if k == "p":
-                        mesh.paused = not mesh.paused
-                    elif k == "f":
-                        mesh.fault["ESP-NOW"] = not mesh.fault["ESP-NOW"]
-                    elif k == "g":
-                        mesh.fault["LoRa"] = not mesh.fault["LoRa"]
-                mesh.step()
-                live.update(render(mesh, console), refresh=True)
+                mesh.poll()
+                live.update(render(mesh, time.time()), refresh=True)
                 time.sleep(max(0.0, TICK - (time.monotonic() - started)))
     except KeyboardInterrupt:
         pass
     finally:
-        if fd is not None and old is not None:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        mesh.stop()
 
 
 if __name__ == "__main__":

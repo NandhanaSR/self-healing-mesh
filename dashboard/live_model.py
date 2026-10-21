@@ -153,6 +153,8 @@ class LiveMesh:
         self.boards = {p: Board(p) for p in ports}
         self.readers = {}
         self.events = deque(maxlen=200)     # (HH:MM:SS, level, msg), same shape as the simulator
+        self.link_changes = 0               # [LINK] lines
+        self.route_changes = 0              # next / priority next changes seen between snapshots
 
     # ---- readers
     def start(self, opener=_open_serial) -> None:
@@ -197,6 +199,7 @@ class LiveMesh:
             self._set_id(b, rec.node, t)
             self._apply_table(b, rec, t)
         elif isinstance(rec, LinkEvent):
+            self.link_changes += 1
             self.log(t, LINK_LEVEL.get(rec.new, "INFO"),
                      f"{b.label}↔N{rec.nbr} {rec.old} → {rec.new}  (ewma {rec.ewma:.1f} dBm · "
                      f"slope {rec.slope:.2f} dB/s · PRR {rec.prr:.2f} · q {rec.q}% · q_pred {rec.q_pred:.2f})")
@@ -251,12 +254,15 @@ class LiveMesh:
         if b.table_time is not None:            # compare with the previous snapshot from this board
             for d in sorted(set(b.routes) | set(new_routes)):
                 old, new = b.routes.get(d), new_routes.get(d)
+                if old and new and (old.next, old.prio_next) == (new.next, new.prio_next):
+                    continue
+                self.route_changes += 1
                 if old and not new:
                     self.log(t, "CRIT", f"{b.label} route →N{d} lost (was next N{old.next})")
                 elif new and not old:
                     self.log(t, "ROUTE", f"{b.label} route →N{d} via N{new.next} "
                                          f"(cost {new.cost:.2f}, priority next N{new.prio_next})")
-                elif (old.next, old.prio_next) != (new.next, new.prio_next):
+                else:
                     self.log(t, "ROUTE", f"{b.label} route →N{d}: next N{old.next} ⇒ N{new.next}, "
                                          f"priority next N{old.prio_next} ⇒ N{new.prio_next} "
                                          f"(cost {new.cost:.2f})")
@@ -297,7 +303,33 @@ class LiveMesh:
         return nodes, "ok"
 
 
-# --------------------------------------------------------------------------- text check mode
+# --------------------------------------------------------------------------- replay / text check mode
+
+
+def replay(paths) -> LiveMesh:
+    """Feed capture files (one per board) into a LiveMesh, one table per second as the firmware
+    prints them. Returns the mesh in its final state."""
+    mesh = LiveMesh(paths)
+    t0 = time.time()
+    for path in paths:
+        mesh.boards[path].connected = True      # a recorded board was connected while recording
+        stream, t = BoardStream(), t0
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+        for line in lines:
+            if line.startswith("---- node"):
+                t += PRINT_INTERVAL_S
+            for rec in stream.feed(line):
+                mesh.apply(path, t, rec)
+        for rec in stream.flush():
+            mesh.apply(path, t, rec)
+    return mesh
+
+
+def replay_now(mesh: LiveMesh) -> float:
+    """The 'current time' for a replayed mesh: its newest table, so nothing shows as stale."""
+    return max((b.table_time or 0.0) for b in mesh.boards.values())
+
 
 
 def summary(mesh: LiveMesh, now: float) -> str:
@@ -334,20 +366,8 @@ def main(argv) -> int:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
     if args.replay:
-        mesh = LiveMesh(args.replay)
-        for path in args.replay:
-            stream = BoardStream()
-            with open(path, encoding="utf-8", errors="replace") as f:
-                lines = f.read().splitlines()
-            t = time.time()
-            for line in lines:
-                if line.startswith("---- node"):
-                    t += PRINT_INTERVAL_S       # one table per second, as the firmware prints them
-                for rec in stream.feed(line):
-                    mesh.apply(path, t, rec)
-            for rec in stream.flush():
-                mesh.apply(path, t, rec)
-        print(summary(mesh, max(b.table_time or 0 for b in mesh.boards.values())))
+        mesh = replay(args.replay)
+        print(summary(mesh, replay_now(mesh)))
         return 0
 
     if not args.ports:

@@ -1,0 +1,18 @@
+Node 2 ready. Type 0-5 = destination, p = toggle priority.
+---- node 2 ----
+  nbr 0  HEALTHY   ewma -60.4  slope 0.04  PRR 1.00 dPRR 0.00  q 91% q_pred 0.91
+  nbr 1  HEALTHY   ewma -58.2  slope 0.01  PRR 1.00 dPRR 0.00  q 94% q_pred 0.94
+  nbr 3  HEALTHY   ewma -64.1  slope -0.03  PRR 1.00 dPRR 0.00  q 86% q_pred 0.86
+  route -> 0  next 0 (cost 1.00) | priority next 0 (hops 1)
+  route -> 1  next 1 (cost 1.00) | priority next 1 (hops 1)
+  route -> 3  next 3 (cost 1.00) | priority next 3 (hops 1)
+[FWD] dest 1 via 1
+[FWD] dest 1 via 1
+---- node 2 ----
+  nbr 0  HEALTHY   ewma -60.2  slope 0.03  PRR 1.00 dPRR 0.00  q 91% q_pred 0.91
+  nbr 1  HEALTHY   ewma -58.3  slope 0.00  PRR 1.00 dPRR 0.00  q 94% q_pred 0.94
+  nbr 3  HEALTHY   ewma -64.0  slope 0.00  PRR 1.00 dPRR 0.00  q 86% q_pred 0.86
+  route -> 0  next 0 (cost 1.00) | priority next 0 (hops 1)
+  route -> 1  next 1 (cost 1.00) | priority next 1 (hops 1)
+  route -> 3  next 3 (cost 1.00) | priority next 3 (hops 1)
+[FWD] dest 1 via 1 (PRIORITY)
