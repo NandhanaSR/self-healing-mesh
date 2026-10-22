@@ -59,21 +59,21 @@ class SerialReader(threading.Thread):
     def __init__(self, port: str, out: queue.Queue, opener=_open_serial):
         super().__init__(name=f"reader-{port}", daemon=True)
         self.port, self.out, self.opener = port, out, opener
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self._ser = None
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._stop_event.is_set():
             try:
                 self._ser = self.opener(self.port)
             except (OSError, ValueError) as e:          # SerialException is an OSError
                 self._emit(PortStatus(False, str(e)))
-                self._stop.wait(RECONNECT_S)
+                self._stop_event.wait(RECONNECT_S)
                 continue
             self._emit(PortStatus(True))
             stream, buf = BoardStream(), b""
             try:
-                while not self._stop.is_set():
+                while not self._stop_event.is_set():
                     chunk = self._ser.read(self._ser.in_waiting or 1)
                     if not chunk:
                         continue
@@ -86,7 +86,7 @@ class SerialReader(threading.Thread):
                 self._emit(PortStatus(False, str(e) or "port closed"))
             finally:
                 self._close()
-            self._stop.wait(RECONNECT_S)
+            self._stop_event.wait(RECONNECT_S)
 
     def send(self, text: str) -> bool:
         """Write to the board (it accepts '0'-'5' and 'p'). False if the port is not open."""
@@ -100,7 +100,7 @@ class SerialReader(threading.Thread):
             return False
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
 
     def _emit(self, rec) -> None:
         self.out.put((self.port, time.time(), rec))
