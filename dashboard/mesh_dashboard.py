@@ -11,7 +11,8 @@ Run:   pip install rich pyserial
        python dashboard/mesh_dashboard.py --ports COM3 COM4 COM5 COM6
        python dashboard/mesh_dashboard.py --demo                  (simulated boards, SIM on screen)
        python dashboard/mesh_dashboard.py --replay FILE [FILE...] (one frame from captures)
-Keys:  Ctrl+C quit
+Keys:  Tab / [ ]  select board     0-5  send destination     p  send priority toggle
+       q or Ctrl+C  quit           (keys go to the selected board only; see keyboard.py)
 Best viewed in Windows Terminal of at least 140x42.
 """
 from __future__ import annotations
@@ -34,6 +35,7 @@ except ImportError:
 
 from demo_anomaly import HIST_LEN, DemoAnomalies, flag_names
 from demo_sim import SimMesh
+from keyboard import Keyboard, KeyControl
 from live_model import MAX_NODES, LiveMesh, replay, replay_now
 
 # --------------------------------------------------------------------------- config
@@ -89,7 +91,7 @@ def board_status(b, now):
     return "[green]● LIVE[/]"
 
 
-def boards_panel(m, now):
+def boards_panel(m, now, selected=None):
     t = Table(box=box.SIMPLE_HEAVY, expand=True, header_style="bold bright_cyan", pad_edge=False, padding=(0, 1, 0, 0), show_edge=False)
     for col, kw in (("NODE", dict(width=4)), ("PORT", dict(min_width=5)), ("STATUS", dict(width=9)),
                     ("DEST", dict(justify="right", width=4)), ("PRIO", dict(justify="right", width=4)),
@@ -98,6 +100,8 @@ def boards_panel(m, now):
         t.add_column(col, **kw)
     for b in sorted_boards(m):
         node = f"N{b.node_id}" if b.node_id is not None else "?"
+        if b.port == selected:
+            node = f"[bold reverse]▶{node}[/]"
         dest = "?" if b.dest is None else f"N{b.dest}"
         prio = "?" if b.priority is None else ("[bold magenta]ON[/]" if b.priority else "[dim]off[/]")
         no_rt = f"[bold red]{b.no_route}[/]" if b.no_route else "0"
@@ -270,7 +274,17 @@ def anomaly_panel(m, anomalies):
                  subtitle="[dim]generated · no sensors[/]", border_style="yellow")
 
 
-def render(m, now, mode="LIVE", anomalies=None):
+def footer_text(mode, keys):
+    if mode == REPLAY_MODE:
+        return "[dim]replay: one recorded frame, no keys[/]"
+    if keys is None:
+        return "[dim]keyboard off (input is not a terminal)[/] · [bold cyan]Ctrl+C[/] Quit"
+    return (f"keys → [bold reverse] {keys.target_label()} [/]   [bold cyan]Tab[/]/[bold cyan]\\[ ][/] select board · "
+            f"[bold cyan]0-5[/] set destination · [bold cyan]p[/] toggle priority · [bold cyan]q[/] quit")
+
+
+def render(m, now, mode="LIVE", anomalies=None, keys=None):
+    """keys: the KeyControl when the keyboard is active, else None."""
     root = Layout()
     root.split_column(Layout(name="head", size=3), Layout(name="top", ratio=10),
                       Layout(name="mid", ratio=9), Layout(name="bot", ratio=9), Layout(name="foot", size=3))
@@ -291,31 +305,34 @@ def render(m, now, mode="LIVE", anomalies=None):
     title.append(f"   {time.strftime('%H:%M:%S', time.localtime(now))}", style="dim")
     root["head"].update(Panel(title, border_style=wcol if worst is not None else "blue", padding=(0, 1)))
 
-    root["top"].split_row(Layout(boards_panel(m, now), size=56), Layout(links_panel(m, now)))
+    root["top"].split_row(Layout(boards_panel(m, now, keys.selected if keys else None), size=56), Layout(links_panel(m, now)))
     root["mid"].split_row(Layout(routes_panel(m), ratio=7), Layout(neighbors_panel(m), ratio=3),
                           Layout(traffic_panel(m), ratio=4))
     root["bot"].split_row(Layout(events_panel(m), ratio=5), Layout(paths_panel(m), ratio=4),
                           Layout(anomaly_panel(m, anomalies), ratio=3))
-    root["foot"].update(Panel("[bold cyan]Ctrl+C[/] Quit", border_style="blue", padding=(0, 1)))
+    root["foot"].update(Panel(footer_text(mode, keys), border_style="blue", padding=(0, 1)))
     return root
 
 
 # --------------------------------------------------------------------------- main
 def run(mesh, mode):
-    """Screen loop: drain the readers, step the DEMO sensors once a second, redraw."""
+    """Screen loop: read keys, drain the readers, step the DEMO sensors once a second, redraw."""
     console = Console()
     anomalies = DemoAnomalies()
     next_sample = 0.0
     try:
-        with Live(render(mesh, time.time(), mode, anomalies), console=console, screen=True,
-                  auto_refresh=False) as live:
+        with Keyboard() as kb, Live(console=console, screen=True, auto_refresh=False) as live:
+            keys = KeyControl(mesh) if kb.enabled else None
             while True:
                 started = time.monotonic()
+                for key in kb.read():
+                    if not keys.handle(key, time.time()):
+                        return
                 mesh.poll()
                 if started >= next_sample:
                     anomalies.step(mesh.by_id())
                     next_sample = started + 1.0
-                live.update(render(mesh, time.time(), mode, anomalies), refresh=True)
+                live.update(render(mesh, time.time(), mode, anomalies, keys), refresh=True)
                 time.sleep(max(0.0, TICK - (time.monotonic() - started)))
     except KeyboardInterrupt:
         pass
