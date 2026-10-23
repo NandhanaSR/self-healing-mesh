@@ -3,11 +3,14 @@
 Keys:  Tab / ]  select next board      [  select previous board
        0-5      send that digit to the selected board (its data destination)
        p        send 'p' to the selected board (toggle priority)
+       space    pause / resume the event log (events are still recorded while paused)
+       f        event log filter: all / important only (hides INFO)
        q        quit (Ctrl+C also quits)
 Anything else, including arrow and function keys, is ignored.
 """
 from __future__ import annotations
 
+import copy
 import os
 import sys
 
@@ -17,6 +20,8 @@ SEND_KEYS = {str(i) for i in range(MAX_NODES)} | {"p"}      # what mesh_node acc
 QUIT_KEYS = {"q", "\x03"}                                    # \x03 = Ctrl+C read as a character
 NEXT_KEYS = {"\t", "]"}
 PREV_KEYS = {"["}
+PAUSE_KEY = " "
+FILTER_KEY = "f"
 
 
 class KeyControl:
@@ -26,6 +31,9 @@ class KeyControl:
         self.mesh = mesh
         self.ports = list(mesh.boards)
         self.index = 0
+        self.paused = None                  # event log frozen: copies of its rows at pause time
+        self.paused_seq = 0
+        self.important_only = False         # event log filter: hide INFO rows
 
     @property
     def selected(self):
@@ -49,10 +57,22 @@ class KeyControl:
             self.index = (self.index - 1) % len(self.ports)
         elif key in SEND_KEYS:
             if self.mesh.send(self.selected, key):
-                self.mesh.log(now, "INFO", f"sent '{key}' to {self.target_label()}")
+                self.mesh.log(now, "INFO", self.target_label(), f"sent '{key}'")
             else:
-                self.mesh.log(now, "WARN", f"{self.selected} not open, key '{key}' ignored")
+                self.mesh.log(now, "WARN", self.selected, f"not open, key '{key}' ignored")
+        elif key == PAUSE_KEY:
+            if self.paused is None:
+                self.paused = [copy.copy(e) for e in self.mesh.events]   # rows as they are now
+                self.paused_seq = self.mesh.event_seq
+            else:
+                self.paused = None
+        elif key == FILTER_KEY:
+            self.important_only = not self.important_only
         return True
+
+    def new_since_pause(self) -> int:
+        """New or updated event rows since the log was paused."""
+        return sum(1 for e in self.mesh.events if e.seq > self.paused_seq)
 
 
 class Keyboard:

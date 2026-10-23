@@ -58,7 +58,7 @@ class KeyControlTests(unittest.TestCase):
     def test_other_keys_send_nothing(self):
         m = FakeMesh(["COM3"])
         k = KeyControl(m)
-        for key in "6789xP \r\n\x1b":
+        for key in "6789xP\r\n\x1b":
             self.assertTrue(k.handle(key, 0.0))
         self.assertEqual(m.sent, [])
         self.assertEqual(list(m.events), [])
@@ -74,8 +74,8 @@ class KeyControlTests(unittest.TestCase):
         k.handle("2", 0.0)
         m.boards["COM3"].node_id = 4
         k.handle("p", 0.0)
-        msgs = [msg for _, _, msg in m.events]
-        self.assertEqual(msgs, ["sent '2' to COM3", "sent 'p' to N4 (COM3)"])
+        msgs = [e.msg for e in m.events]
+        self.assertEqual(msgs, ["COM3 sent '2'", "N4 (COM3) sent 'p'"])
 
     def test_port_not_open(self):
         m = FakeMesh(["COM3", "COM4"], open_ports=["COM3"])
@@ -83,7 +83,7 @@ class KeyControlTests(unittest.TestCase):
         k.handle("]", 0.0)
         k.handle("1", 0.0)
         self.assertEqual(m.sent, [])
-        self.assertEqual(list(m.events)[-1][1:], ("WARN", "COM4 not open, key '1' ignored"))
+        self.assertEqual((m.events[-1].level, m.events[-1].msg), ("WARN", "COM4 not open, key '1' ignored"))
 
     def test_no_ports(self):
         k = KeyControl(FakeMesh([]))
@@ -122,7 +122,7 @@ class RenderTests(unittest.TestCase):
         text = self.draw(m, keys=k)
         self.assertIn("▶N2", text)
         self.assertIn("keys →  N2 (COM4)", text)
-        self.assertIn("Tab/[ ] select board", text)
+        self.assertIn("Tab/[ ] board · 0-5 dest · p prio · space pause log · f filter log · q quit", text)
 
     def test_footer_without_keyboard(self):
         self.assertIn("keyboard off", self.draw(FakeMesh(["COM3"])))

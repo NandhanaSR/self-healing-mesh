@@ -11,8 +11,10 @@ Run:   pip install rich pyserial
        python dashboard/mesh_dashboard.py --ports COM3 COM4 COM5 COM6
        python dashboard/mesh_dashboard.py --demo                  (simulated boards, SIM on screen)
        python dashboard/mesh_dashboard.py --replay FILE [FILE...] (one frame from captures)
+       add --hide-delivery to any of these to hide the Delivery % figure in TRAFFIC
 Keys:  Tab / [ ]  select board     0-5  send destination     p  send priority toggle
-       q or Ctrl+C  quit           (keys go to the selected board only; see keyboard.py)
+       space  pause event log      f  event log: all / important only
+       q or Ctrl+C  quit           (0-5 / p go to the selected board only; see keyboard.py)
 Best viewed in Windows Terminal of at least 140x42.
 """
 from __future__ import annotations
@@ -59,6 +61,7 @@ Q_TH = 0.50                 # config.h: q_pred below this -> DEGRADING (used for
 Q_RECOVER = 0.65            # config.h: back to HEALTHY above this
 RSSI_MIN, RSSI_MAX = -85, -40   # config.h: RSSI score range, used to scale the ewma sparkline
 DEFAULT_DEST_ID = 1         # config.h: data destination a board starts with
+DELIVERY_OK, DELIVERY_WARN = 85, 60     # Delivery % colour: green at/above OK, yellow at/above WARN, else red
 
 LINK_RANK = {"HEALTHY": 0, "DEGRADING": 1, "DEAD": 2}
 LINK_STYLE = {"HEALTHY": "green", "DEGRADING": "yellow", "DEAD": "bold white on red"}
@@ -196,7 +199,34 @@ def neighbors_panel(m):
     return Panel(Group(t, legend), title="[bold]NEIGHBORS[/]", border_style="blue")
 
 
-def traffic_panel(m):
+def delivery_style(pct):
+    return "green" if pct >= DELIVERY_OK else "yellow" if pct >= DELIVERY_WARN else "bold red"
+
+
+def delivery_rows(m, now):
+    """One (label, value) per identified sender: its DATA delivered / sent to its current destination."""
+    boards = m.by_id()
+    rows = []
+    for b in sorted_boards(m):
+        if b.node_id is None or b.data_dest == b.node_id:
+            continue
+        label = f"{b.label} → N{b.data_dest}"
+        dest = boards.get(b.data_dest)
+        if dest is None:
+            rows.append((label, "[dim]dest not connected[/]"))
+            continue
+        d = m.delivery.get((b.node_id, b.data_dest))
+        if d is None or not d.sent:
+            rows.append((label, "[dim]—[/]"))
+            continue
+        pct = min(100.0, d.pct)
+        live = b.counting(now) and dest.counting(now)
+        style = delivery_style(pct) if live else "dim"
+        rows.append((label, f"[{style}]{d.delivered}/{d.sent} ({pct:.0f}%)[/]" + ("" if live else " [dim]paused[/]")))
+    return rows
+
+
+def traffic_panel(m, now, show_delivery=True):
     t = Table(box=box.SIMPLE_HEAVY, expand=True, show_header=False, padding=(0, 1), show_edge=False)
     t.add_column(style="dim")
     t.add_column(justify="right", style="bold")
@@ -211,18 +241,73 @@ def traffic_panel(m):
             t.add_row("  from", f"[dim]{per_src}[/]")
     t.add_row("Link changes", str(m.link_changes))
     t.add_row("Route changes", str(m.route_changes))
+    if show_delivery:
+        rows = delivery_rows(m, now)
+        if rows:
+            t.add_row("[bold]Delivery %[/]", "[dim]recv/sent[/]")
+            for label, value in rows:
+                t.add_row(f"  {label}", value)
     return Panel(t, title="[bold]TRAFFIC[/]  [dim]serial lines since start[/]", border_style="magenta")
 
 
-def events_panel(m):
-    t = Table(box=box.SIMPLE, expand=True, show_header=False, padding=(0, 1))
-    t.add_column(width=8, style="dim")
-    t.add_column(width=6)
-    t.add_column(overflow="fold")
-    for stamp, level, msg in list(m.events)[::-1][:40]:
-        style = LEVEL_STYLE.get(level, "white")
-        t.add_row(stamp, f"[{style}]{level}[/]", Text(msg, style=style if level == "CRIT" else ""))
-    return Panel(t, title="[bold]EVENT LOG[/]  [dim]newest first[/]", border_style="cyan")
+EVENT_WHO_W = 11            # widest "who" shown in the event log before it is cut with …
+
+
+def link_event_text(rec):
+    """First row of a link change: states coloured as in LINK HEALTH, q_pred by threshold."""
+    out = Text()
+    out.append(rec.old, style=LINK_STYLE.get(rec.old, "bright_white"))
+    out.append("→", style="bright_white")
+    out.append(rec.new, style=LINK_STYLE.get(rec.new, "bright_white"))
+    out.append("  q_pred ", style="bright_white")
+    out.append(f"{rec.q_pred:.2f}", style=q_style(rec.q_pred))
+    return out
+
+
+def link_values_text(rec):
+    """Second row of a link change: dim labels, values coloured as in LINK HEALTH."""
+    out = Text(" " * 9)
+    for label, value, style in (("ewma", f"{rec.ewma:.1f}", "bright_white"),
+                                ("slope", f"{rec.slope:.2f}", "red" if rec.slope < 0 else "bright_white"),
+                                ("PRR", f"{rec.prr:.2f}", "bright_white"),
+                                ("q", f"{rec.q}%", q_style(rec.q / 100.0))):
+        out.append(("  " if label != "ewma" else "") + label + " ", style="dim")
+        out.append(value, style=style)
+    return out
+
+
+def events_panel(m, keys=None):
+    """One row per event: time, icon, who, summary + dim detail (cut with … rather than wrapped).
+    Link changes get a second row with the values the board printed at that moment."""
+    paused = keys is not None and keys.paused is not None
+    important = keys is not None and keys.important_only
+    rows = keys.paused if paused else m.events
+    t = Table(box=None, expand=True, show_header=False, padding=(0, 0))
+    t.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+    t.add_column(justify="right", no_wrap=True, style="bold")
+    shown = [e for e in reversed(rows) if e.important or not important][:40]
+    who_w = min(EVENT_WHO_W, max((len(e.who) for e in shown), default=0))
+    for e in shown:
+        style = LEVEL_STYLE.get(e.level, "white")
+        who = e.who if len(e.who) <= who_w else e.who[:who_w - 1] + "…"
+        line = Text()
+        line.append(f"{e.stamp} ", style="dim")            # dim the time only, not the whole row
+        line.append(e.icon, style=style)
+        line.append(f" {who:<{who_w}} ", style="bold")
+        if e.link is not None:
+            line.append_text(link_event_text(e.link))
+        else:
+            line.append(e.text, style="bold red" if e.level == "CRIT" else "bright_white")
+            if e.detail:
+                line.append("  " + e.detail, style="dim")
+        t.add_row(line, f" ×{e.count}" if e.count > 1 else "")
+        if e.link is not None:              # values row, indented under the icon: as much room as possible
+            t.add_row(link_values_text(e.link), "")
+    title = "[bold]EVENT LOG[/]  [dim]newest first · " + ("important" if important else "all") + "[/]"
+    if paused:
+        title += f"  [bold black on yellow] PAUSED · {keys.new_since_pause()} new [/]"
+    body = t if shown else Text("no important events yet" if important else "no events yet", style="dim")
+    return Panel(body, title=title, border_style="yellow" if paused else "cyan")
 
 
 def paths_panel(m):
@@ -279,11 +364,12 @@ def footer_text(mode, keys):
         return "[dim]replay: one recorded frame, no keys[/]"
     if keys is None:
         return "[dim]keyboard off (input is not a terminal)[/] · [bold cyan]Ctrl+C[/] Quit"
-    return (f"keys → [bold reverse] {keys.target_label()} [/]   [bold cyan]Tab[/]/[bold cyan]\\[ ][/] select board · "
-            f"[bold cyan]0-5[/] set destination · [bold cyan]p[/] toggle priority · [bold cyan]q[/] quit")
+    return (f"keys → [bold reverse] {keys.target_label()} [/]  [bold cyan]Tab[/]/[bold cyan]\\[ ][/] board · "
+            f"[bold cyan]0-5[/] dest · [bold cyan]p[/] prio · [bold cyan]space[/] pause log · "
+            f"[bold cyan]f[/] filter log · [bold cyan]q[/] quit")
 
 
-def render(m, now, mode="LIVE", anomalies=None, keys=None):
+def render(m, now, mode="LIVE", anomalies=None, keys=None, show_delivery=True):
     """keys: the KeyControl when the keyboard is active, else None."""
     root = Layout()
     root.split_column(Layout(name="head", size=3), Layout(name="top", ratio=10),
@@ -307,15 +393,15 @@ def render(m, now, mode="LIVE", anomalies=None, keys=None):
 
     root["top"].split_row(Layout(boards_panel(m, now, keys.selected if keys else None), size=56), Layout(links_panel(m, now)))
     root["mid"].split_row(Layout(routes_panel(m), ratio=7), Layout(neighbors_panel(m), ratio=3),
-                          Layout(traffic_panel(m), ratio=4))
-    root["bot"].split_row(Layout(events_panel(m), ratio=5), Layout(paths_panel(m), ratio=4),
+                          Layout(traffic_panel(m, now, show_delivery), ratio=4))
+    root["bot"].split_row(Layout(events_panel(m, keys), ratio=5), Layout(paths_panel(m), ratio=4),
                           Layout(anomaly_panel(m, anomalies), ratio=3))
     root["foot"].update(Panel(footer_text(mode, keys), border_style="blue", padding=(0, 1)))
     return root
 
 
 # --------------------------------------------------------------------------- main
-def run(mesh, mode):
+def run(mesh, mode, show_delivery=True):
     """Screen loop: read keys, drain the readers, step the DEMO sensors once a second, redraw."""
     console = Console()
     anomalies = DemoAnomalies()
@@ -332,7 +418,7 @@ def run(mesh, mode):
                 if started >= next_sample:
                     anomalies.step(mesh.by_id())
                     next_sample = started + 1.0
-                live.update(render(mesh, time.time(), mode, anomalies, keys), refresh=True)
+                live.update(render(mesh, time.time(), mode, anomalies, keys, show_delivery), refresh=True)
                 time.sleep(max(0.0, TICK - (time.monotonic() - started)))
     except KeyboardInterrupt:
         pass
@@ -347,7 +433,9 @@ def main(argv=None):
     src.add_argument("--demo", action="store_true", help="simulated boards (SIM on screen), no hardware needed")
     src.add_argument("--replay", nargs="+", metavar="FILE",
                      help="print one frame from recorded serial captures (one file per board) and exit")
+    ap.add_argument("--hide-delivery", action="store_true", help="hide the Delivery %% figure in TRAFFIC")
     args = ap.parse_args(argv)
+    show_delivery = not args.hide_delivery
     if hasattr(sys.stdout, "reconfigure"):      # redirected output on Windows defaults to cp1252 (no ●, █, →)
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -357,16 +445,17 @@ def main(argv=None):
         for _ in range(HIST_LEN):
             anomalies.step(mesh.by_id())
         console = Console()
-        console.print(render(mesh, replay_now(mesh), REPLAY_MODE, anomalies), height=max(42, console.size.height))
+        console.print(render(mesh, replay_now(mesh), REPLAY_MODE, anomalies, show_delivery=show_delivery),
+                      height=max(42, console.size.height))
     elif args.demo:
         sim = SimMesh()
         mesh = LiveMesh(sim.ports)
         mesh.start(opener=sim.open)             # same SerialReader path as real ports
-        run(mesh, SIM_MODE)
+        run(mesh, SIM_MODE, show_delivery)
     else:
         mesh = LiveMesh(args.ports)
         mesh.start()
-        run(mesh, "LIVE")
+        run(mesh, "LIVE", show_delivery)
 
 
 if __name__ == "__main__":

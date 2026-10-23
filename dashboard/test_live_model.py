@@ -46,16 +46,16 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(set(b.neighbors), {1})
         self.assertEqual(set(b.routes), {1})
         self.assertEqual(list(b.ewma_hist[1]), [-60, -61])
-        self.assertIn("route →N4 lost", m.events[-1][2])
+        self.assertEqual((m.events[-1].who, m.events[-1].text), ("N2 →N4", "route lost"))
 
     def test_route_change_logged_but_not_on_first_table(self):
         m = LiveMesh(["COM3"])
         m.apply("COM3", T0, table(2, routes=[route(4, 3)]))
         self.assertEqual(len(m.events), 0)
         m.apply("COM3", T0 + 1, table(2, routes=[route(4, 1, prio=1, cost=3.0)]))
-        lvl, msg = m.events[-1][1:]
-        self.assertEqual(lvl, "ROUTE")
-        self.assertIn("next N3 ⇒ N1", msg)
+        e = m.events[-1]
+        self.assertEqual((e.level, e.who), ("ROUTE", "N2 →N4"))
+        self.assertEqual(e.text, "next N3⇒N1  prio N3⇒N1")      # only the hops that changed
 
     def test_no_route_logged_once_until_recovered(self):
         from serial_parser import Forward, NoRoute
@@ -66,7 +66,7 @@ class ModelTests(unittest.TestCase):
         m.apply("COM3", T0 + 6, Forward(1, 2, False))
         b = m.boards["COM3"]
         self.assertEqual((b.no_route, b.fwd), (5, 1))
-        self.assertEqual([e[1] for e in m.events], ["CRIT", "OK"])
+        self.assertEqual([e.level for e in m.events], ["CRIT", "OK"])
 
     def test_dest_and_priority_unknown_until_printed(self):
         from serial_parser import DestChanged, PriorityChanged
@@ -83,8 +83,8 @@ class ModelTests(unittest.TestCase):
         m = LiveMesh(["COM3", "COM4"])
         m.apply("COM3", T0, table(0))
         m.apply("COM4", T0, table(0))
-        self.assertEqual(m.events[-1][1], "WARN")
-        self.assertIn("MY_ID 0", m.events[-1][2])
+        self.assertEqual(m.events[-1].level, "WARN")
+        self.assertIn("MY_ID 0", m.events[-1].msg)
 
     def test_reboot_clears_tables(self):
         from serial_parser import Ready
@@ -113,7 +113,7 @@ class ModelTests(unittest.TestCase):
         self.assertEqual(b.priority, True)
         self.assertEqual((b.fwd, b.fwd_prio, b.delivered), (5, 2, 1))
         self.assertEqual(list(b.qpred_hist[3]), [0.84, 0.55, 0.38, 0.22, 0.0])
-        levels = [e[1] for e in m.events]
+        levels = [e.level for e in m.events]
         self.assertIn("WARN", levels)           # HEALTHY -> DEGRADING
         self.assertIn("ROUTE", levels)          # route to 4 moved from N3 to N1
 
