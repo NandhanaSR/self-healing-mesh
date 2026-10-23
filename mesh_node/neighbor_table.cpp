@@ -16,6 +16,7 @@ bool nt_add(uint8_t id, const uint8_t* mac, int8_t rssi, uint32_t now) {
     n.active = true;
     link_init(n.link, rssi, now);
     n.reportedState = LINK_DEAD;   // forces a "link up" event the first time we sync
+    n.reportedCost = ROUTE_INF;
   } else {
     link_on_rx(n.link, rssi, now);
   }

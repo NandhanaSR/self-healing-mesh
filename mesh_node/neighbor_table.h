@@ -9,6 +9,7 @@ struct Neighbor {
   uint8_t   mac[6];
   LinkStats link;
   LinkState reportedState;   // last state we told the routing module about
+  float reportedCost;   // last cost we advertised for this link
 };
 
 void      nt_init();
