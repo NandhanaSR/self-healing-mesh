@@ -35,6 +35,10 @@ Full plan and background: `docs/dashboard-integration.md`.
   next hops across the boards' tables.
 - Not available from the firmware: MAC addresses, TX/RX/drop counters, latency.
   Drop those columns rather than adding firmware output.
+- ESP32-C3 mini boards run at reduced TX power (`WIFI_POWER_8_5dBm`, set in
+  `transport_init()` in `transport.cpp`) because of a hardware antenna flaw: at full power
+  they fail and overheat. Their links are weaker than the DevKits', so lower ewma/q on links
+  to or from a C3 is expected and is not a bug.
 
 ## Serial output (115200 baud), exact formats from `mesh_node.ino`
 
