@@ -42,7 +42,7 @@ Adjust Q_TH, Q_RECOVER, PREDICT_HORIZON_S in config.h until Degrading fires with
 | window K = 5  (eq.5) | SLOPE_WINDOW = 5 | exact |
 | prediction q_hat(t+tau)  (eq.3/10), Micro-LSTM | linear extrapolation: E + slope*tau and PRR + dPRR, tau = 3 s | NO ML - this is our replacement |
 | degradation flag y = 1 if q_hat < Q_th  (eq.4/11) | HEALTHY -> DEGRADING when q_pred < Q_TH (0.5) | exact rule, our predictor |
-| routing penalty = COST_SCALE * (1 - q_pred) | link_penalty(): penalty = 10*(1 - q_pred) | predicted quality q_pred directly used for routing penalty |
+| routing penalty = COST_SCALE * (1 - q_pred) | link_penalty(): penalty = 10*(1 - q_pred) | predicted quality q_pred used for routing penalty; refreshed on every rx/tx while Degrading |
 | hysteresis: switch only if cur_cost - new_cost > 0.10 | routing.cpp: keep current next hop unless new path cheaper by > ROUTE_HYST_MARGIN (0.10f); dead next hop = switch immediately | floating-point cost hysteresis |
 | localized update, one-hop advert  (sec 2.3) | triggered route advert on link-state change (mesh_node.ino) | |
 Our own (not from any paper): least-squares slope in dB/s, quality weights 0.6/0.4, anomaly detector, priority (fewest-hop) path.

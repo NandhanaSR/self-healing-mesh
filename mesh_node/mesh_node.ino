@@ -18,6 +18,7 @@ static uint8_t  g_dest = DEFAULT_DEST_ID;
 static bool     g_prio = false;
 static bool     g_advPending = false;
 static uint32_t tHello = 0, tHb = 0, tAdv = 0, tData = 0, tPrint = 0;
+static uint32_t tLastTrigAdv = 0;
 
 static void fillHeader(PacketHeader& h, uint8_t type, uint8_t dest, uint8_t prio) {
   h.type = type; h.src = MY_ID; h.dest = dest; h.prio = prio; h.seq = g_seq++; h.ttl = MAX_TTL;
@@ -31,13 +32,34 @@ static bool usable(uint8_t id) {
 // Tell the routing module whenever a link changes state (this is the "event-triggered" update).
 static void syncLinkState(uint8_t id) {
   Neighbor* n = nt_get(id);
-  if (!n || !n->active || n->link.state == n->reportedState) return;
-  Serial.printf("[LINK] node %u: %s -> %s  (ewma %.1f dBm, slope %.2f dB/s, PRR %.2f, q %u%%, q_pred %.2f)\n",
-                id, link_state_name(n->reportedState), link_state_name(n->link.state),
-                n->link.ewma, n->link.slope, n->link.prr, n->link.health, n->link.qPred);
-  n->reportedState = n->link.state;
+  if (!n || !n->active) return;
+  uint32_t now = millis();
   float penalty = link_penalty(n->link);
-  if (routing_set_link_state(id, n->link.state, penalty)) g_advPending = true;
+
+  // Path A: state changed -> same as before, push immediately
+  if (n->link.state != n->reportedState) {
+    Serial.printf("[LINK] node %u: %s -> %s  (ewma %.1f dBm, slope %.2f dB/s, PRR %.2f, q %u%%, q_pred %.2f)\n",
+                  id, link_state_name(n->reportedState), link_state_name(n->link.state),
+                  n->link.ewma, n->link.slope, n->link.prr, n->link.health, n->link.qPred);
+    n->reportedState = n->link.state;
+    n->reportedCost = (n->link.state == LINK_DEAD)    ? ROUTE_INF
+                    : (n->link.state == LINK_HEALTHY) ? COST_HEALTHY
+                                                      : COST_HEALTHY + penalty;
+    if (routing_set_link_state(id, n->link.state, penalty)) { g_advPending = true; tLastTrigAdv = now; }
+    return;
+  }
+
+  // Path B: still DEGRADING -> keep the penalty tracking q_pred
+  if (n->link.state == LINK_DEGRADING) {
+    bool changed = routing_set_link_state(id, LINK_DEGRADING, penalty);   // always applied locally
+    float cost = COST_HEALTHY + penalty;
+    if (changed && fabsf(cost - n->reportedCost) >= COST_ADV_DELTA
+                && now - tLastTrigAdv >= ADV_MIN_GAP_MS) {
+      n->reportedCost = cost;
+      g_advPending = true;
+      tLastTrigAdv = now;
+    }
+  }
 }
 
 static void sendHello() { PacketHeader h; fillHeader(h, PKT_HELLO, 0xFF, 0); transport_broadcast(&h, sizeof(h)); }

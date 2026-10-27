@@ -36,6 +36,9 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len
 
 bool transport_init() {
   WiFi.mode(WIFI_STA);
+#if CONFIG_IDF_TARGET_ESP32C3
+  WiFi.setTxPower(WIFI_POWER_8_5dBm);   // C3 mini boards: antenna flaw, full power fails and overheats
+#endif
   WiFi.disconnect();                                   // no router, no access point
   esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
   if (esp_now_init() != ESP_OK) return false;

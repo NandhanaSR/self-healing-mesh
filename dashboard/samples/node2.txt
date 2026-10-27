@@ -1,0 +1,46 @@
+ets Jul 29 2019 12:21:46
+
+rst:0x1 (POWERON_RESET),boot:0x13 (SPI_FAST_FLASH_BOOT)
+Node 2 ready. Type 0-5 = destination, p = toggle priority.
+---- node 2 ----
+[LINK] node 1: DEAD -> HEALTHY  (ewma -58.0 dBm, slope 0.00 dB/s, PRR 1.00, q 95%, q_pred 0.95)
+[LINK] node 3: DEAD -> HEALTHY  (ewma -66.0 dBm, slope 0.00 dB/s, PRR 1.00, q 85%, q_pred 0.85)
+---- node 2 ----
+  nbr 1  HEALTHY   ewma -58.4  slope 0.12  PRR 1.00 dPRR 0.00  q 92% q_pred 0.91
+  nbr 3  HEALTHY   ewma -66.2  slope -0.05  PRR 1.00 dPRR 0.00  q 84% q_pred 0.84
+  route -> 1  next 1 (cost 1.00) | priority next 1 (hops 1)
+  route -> 3  next 3 (cost 1.00) | priority next 3 (hops 1)
+  route -> 4  next 3 (cost 2.00) | priority next 3 (hops 2)
+[FWD] dest 1 via 1
+---- node 2 ----
+  nbr 1  HEALTHY   ewma -58.1  slope 0.10  PRR 1.00 dPRR 0.00  q 93% q_pred 0.92
+  nbr 3  HEALTHY   ewma -74.9  slope -1.20  PRR 0.90 dPRR -0.10  q 60% q_pred 0.55
+  route -> 1  next 1 (cost 1.00) | priority next 1 (hops 1)
+  route -> 3  next 3 (cost 1.00) | priority next 3 (hops 1)
+  route -> 4  next 3 (cost 2.00) | priority next 3 (hops 2)
+[FWD] dest 1 via 1
+[LINK] node 3: HEALTHY -> DEGRADING  (ewma -81.7 dBm, slope -1.85 dB/s, PRR 0.70, q 41%, q_pred 0.38)
+---- node 2 ----
+  nbr 1  HEALTHY   ewma -58.2  slope 0.05  PRR 1.00 dPRR 0.00  q 93% q_pred 0.92
+  nbr 3  DEGRADING ewma -81.7  slope -1.85  PRR 0.70 dPRR -0.20  q 41% q_pred 0.38
+  route -> 1  next 1 (cost 1.00) | priority next 1 (hops 1)
+  route -> 3  next 3 (cost 3.50) | priority next 1 (hops 1)
+  route -> 4  next 1 (cost 3.00) | priority next 1 (hops 3)
+[FWD] dest 1 via 1
+p
+priority = ON
+[FWD] dest 1 via 1 (PRIORITY)
+---- node 2 ----
+  nbr 1  HEALTHY   ewma -58.3  slope 0.02  PRR 1.00 dPRR 0.00  q 93% q_pred 0.92
+  nbr 3  DEGRADING ewma -84.0  slope -2.10  PRR 0.50 dPRR -0.20  q 30% q_pred 0.22
+  route -> 1  next 1 (cost 1.00) | priority next 1 (hops 1)
+  route -> 3  next 1 (cost 3.00) | priority next 1 (hops 2)
+  route -> 4  next 1 (cost 3.00) | priority next 1 (hops 3)
+[LINK] node 3: DEGRADING -> DEAD  (ewma -88.0 dBm, slope -2.40 dB/s, PRR 0.00, q 0%, q_pred 0.00)
+[FWD] dest 1 via 1 (PRIORITY)
+[DATA] from 4  s1=1873 s2=-3  anomaly=0x00/0x1F  PRIORITY
+---- node 2 ----
+  nbr 1  HEALTHY   ewma -58.1  slope 0.00  PRR 1.00 dPRR 0.00  q 93% q_pred 0.93
+  nbr 3  DEAD      ewma -88.0  slope -2.40  PRR 0.00 dPRR 0.00  q 0% q_pred 0.00
+  route -> 1  next 1 (cost 1.00) | priority next 1 (hops 1)
+  route -> 4  next 1 (cost 3.00) | priority next 1 (hops 3)
